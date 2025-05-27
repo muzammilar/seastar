@@ -13,6 +13,7 @@
 #include <seastar/core/do_with.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/when_all.hh>
+#include <seastar/core/units.hh>
 #include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
 #include "loopback_socket.hh"
@@ -941,6 +942,41 @@ SEASTAR_TEST_CASE(test_client_response_eof) {
     });
 }
 
+SEASTAR_TEST_CASE(test_client_head_empty_body) {
+    return seastar::async([] {
+        loopback_connection_factory lcf(1);
+        auto ss = lcf.get_server_socket();
+        future<> server = ss.accept().then([] (accept_result ar) {
+            return seastar::async([sk = std::move(ar.connection)] () mutable {
+                input_stream<char> in = sk.input();
+                read_simple_http_request(in);
+                output_stream<char> out = sk.output();
+                out.write(format("HTTP/1.1 200 OK\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n", 128)).get();
+                out.flush().get();
+                out.close().get();
+            });
+        });
+
+        future<> client = seastar::async([&lcf] {
+            auto cln = http::experimental::client(std::make_unique<loopback_http_factory>(lcf));
+            auto req = http::request::make("HEAD", "test", "/test");
+            cln.make_request(std::move(req), [] (const http::reply& rep, input_stream<char>&& in) {
+                return seastar::async([&rep, in = std::move(in)] () mutable {
+                    BOOST_REQUIRE_EQUAL(rep._status, http::reply::status_type::ok);
+                    BOOST_REQUIRE_EQUAL(rep.content_length, 128);
+                    auto buf = in.read().get();
+                    BOOST_REQUIRE(buf.empty());
+                    in.close().get();
+                });
+            }).get();
+
+            cln.close().get();
+        });
+
+        when_all(std::move(client), std::move(server)).discard_result().get();
+    });
+}
+
 SEASTAR_TEST_CASE(test_client_retry_nested) {
     return seastar::async([] {
         loopback_connection_factory lcf(1);
@@ -1422,6 +1458,64 @@ future<> check_http_reply (std::vector<sstring>&& req_parts, std::vector<std::st
         server.stop().get();
     });
 };
+
+future<> head_handler_no_body(bool chunked) {
+    return seastar::async([chunked] {
+        loopback_connection_factory lcf(1);
+        http_server server("test");
+        loopback_socket_impl lsi(lcf);
+        httpd::http_server_tester::listeners(server).emplace_back(lcf.get_server_socket());
+
+        future<> client = seastar::async([&lsi, chunked] {
+            connected_socket c_socket = lsi.connect(socket_address(ipv4_addr()), socket_address(ipv4_addr())).get();
+            input_stream<char> input(c_socket.input());
+            output_stream<char> output(c_socket.output());
+
+            output.write(sstring("HEAD /test HTTP/1.1\r\nHost: test\r\nContent-Length: 1\r\n\r\nA")).get();
+            output.flush().get();
+            auto resp = input.read().get();
+            auto resp_s = std::string(resp.get(), resp.size());
+            fmt::print("resp:[{}]", resp_s);
+            BOOST_REQUIRE_NE(resp_s.find("200 OK"), std::string::npos);
+
+            // RFC7231 section 4.3.2
+            // The HEAD method is identical to GET except that the server MUST NOT
+            // send a message body in the response (i.e., the response terminates at
+            // the end of the header section).
+            //
+            // The server SHOULD send the same header fields in response to a HEAD
+            // request as it would have sent if the request had been a GET, except
+            // that the payload header fields MAY be omitted
+
+            // Seastar HTTPD doesn't omit header fields ..
+            if (chunked) {
+                BOOST_REQUIRE_NE(resp_s.find("Transfer-Encoding: chunked\r\n"), std::string::npos);
+            } else {
+                BOOST_REQUIRE_NE(resp_s.find("Content-Length: 1\r\n"), std::string::npos);
+            }
+
+            // ... but does omit the body itself
+            BOOST_REQUIRE_EQUAL(resp_s.find("\r\n\r\n"), resp_s.size() - 4);
+
+            input.close().get();
+            output.close().get();
+        });
+
+        server._routes.put(HEAD, "/test", new echo_string_handler(chunked));
+        server.do_accepts(0).get();
+
+        client.get();
+        server.stop().get();
+    });
+}
+
+SEASTAR_TEST_CASE(head_handler_no_body_content_length) {
+    return head_handler_no_body(false);
+}
+
+SEASTAR_TEST_CASE(head_handler_no_body_chunked) {
+    return head_handler_no_body(true);
+}
 
 static future<> test_basic_content(bool streamed, bool chunked_reply) {
     return seastar::async([streamed, chunked_reply] {
@@ -2001,10 +2095,10 @@ SEASTAR_THREAD_TEST_CASE(test_http_with_broken_wire) {
 SEASTAR_TEST_CASE(test_client_close_connection) {
     return async([] {
         loopback_connection_factory lcf(1);
-        auto cln = http::experimental::client(std::make_unique<loopback_http_factory>(lcf), 1, http::experimental::client::retry_requests::no);
-        auto make_test_request = [&cln]() {
+        auto make_test_request = [&lcf]() {
+            auto cln = http::experimental::client(std::make_unique<loopback_http_factory>(lcf), 1, http::experimental::client::retry_requests::no);
             size_t content_length = 0;
-            for (auto cycle : {1, 2}) {
+            for (auto _ [[maybe_unused]] : {1, 2}) {
                 auto req = http::request::make("GET", "test", "/test");
                 auto make_request = cln.make_request(
                     std::move(req),
@@ -2018,13 +2112,9 @@ SEASTAR_TEST_CASE(test_client_close_connection) {
                         });
                     },
                     http::reply::status_type::ok);
-
-                if (cycle == 1) {
-                    BOOST_REQUIRE_NO_THROW(make_request.get());
-                } else {
-                    BOOST_REQUIRE_THROW(make_request.get(), httpd::response_parsing_exception);
-                }
+                BOOST_REQUIRE_NO_THROW(make_request.get());
             }
+            cln.close().get();
         };
 
         size_t response_size = 0;
@@ -2033,31 +2123,42 @@ SEASTAR_TEST_CASE(test_client_close_connection) {
                 input_stream<char> in = sk.input();
                 read_simple_http_request(in);
                 output_stream<char> out = sk.output();
-                try {
-                    sstring r200(format("HTTP/1.1 200 OK\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n", response_size));
+                size_t responses = 0;
+                // In the case the leftover data on the socket is smaller than 128KiB we are going to drain it and leave the connection alive, so here we
+                // have to loop two times to fulfill two request from the client. On the other hand if the leftover data is larger than 128KiB we are going
+                // to close the connection, so we have to loop only once to fulfill one request from the client and make another `accept`
+                while (true) {
+                    if (responses == 2) {
+                        break;
+                    }
+                    ++responses;
+                    try {
+                        out.write(format("HTTP/1.1 200 OK\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n", response_size)).get();
+                        out.flush().get();
+                        out.write(sstring(response_size / 2, 'a')).get();
+                        out.flush().get();
 
-                    out.write(r200).get();
-                    out.flush().get();
-                    out.write(sstring(response_size / 2, 'a')).get();
-                    out.flush().get();
-
-                    out.write(sstring(response_size / 2, 'a')).get();
-                    out.flush().get();
-                    out.close().get();
-                } catch (...) {
-                    out.close().get();
+                        out.write(sstring(response_size / 2, 'a')).get();
+                        out.flush().get();
+                    } catch (...) {
+                        break;
+                    }
                 }
+                out.close().get();
             });
         };
 
-        for (auto size : {128 * 1024ul, 260 * 1024ul}) {
+        for (auto size : {128_KiB, 260_KiB}) {
             response_size = size;
             auto ss = lcf.get_server_socket();
             auto server = ss.accept().then(make_response);
+            if (size > 128_KiB) {
+                // In this case the client is going to reset the connection so we have to `accept` again
+                server = server.then([&ss, &make_response] { return ss.accept().then(make_response); });
+            }
             auto client = async([&make_test_request] { make_test_request(); });
 
             when_all(std::move(server), std::move(client)).discard_result().get();
         }
-        cln.close().get();
     });
 }
