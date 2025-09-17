@@ -40,7 +40,8 @@ class io_sink;
 
 }
 
-enum class nowait_mode { yes, no };
+enum class nowait_mode { yes, no, read_only };
+
 template <typename FileImpl>
 class posix_file_handle_impl : public seastar::file_handle_impl {
     int _fd;
