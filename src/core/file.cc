@@ -711,6 +711,37 @@ static bool blockdev_nowait_works(dev_t device_id) {
     return blockdev_gen_nowait_works;
 }
 
+static nowait_mode filesystem_nowait_mode(bool fs_capable, std::optional<bool> cfg_override) {
+    if (!fs_capable) {
+        return nowait_mode::no;
+    }
+    if (cfg_override.has_value()) {
+        return *cfg_override ? nowait_mode::yes : nowait_mode::no;
+    }
+
+    // First, the nowait became useable in 4.13, see
+    // https://lore.kernel.org/linux-xfs/20210117213401.GB78941@dread.disaster.area/
+    // and seastar commit 487d04ee (file, reactor: reinstate RWF_NOWAIT support)
+    //
+    // Then it was (un)intentionally broken by Linux-6.0 commit 66fa3ced (fs: Add
+    // async write file modification handling) so that lots of writes hit the need
+    // to update cmtimes for an inode and returned EAGAIN seeing the nowait flag.
+    // The change effectively allowed only read-only nowait AIO
+    //
+    // In Linux-7.0 lazytime mode cmtime update was patched to work nicely with the
+    // nowait flag, see 77ef2c3f (re-enable IOCB_NOWAIT writes to files v6)
+
+    if (internal::kernel_uname().whitelisted({"7.0"})) {
+        return nowait_mode::yes;
+    } else if (internal::kernel_uname().whitelisted({"6.0"})) {
+        return nowait_mode::read_only; // seastar issue #2974
+    } else if (internal::kernel_uname().whitelisted({"4.13"})) {
+        return nowait_mode::yes;
+    } else {
+        return nowait_mode::no;
+    }
+}
+
 future<>
 blockdev_file_impl::truncate(uint64_t length) noexcept {
     return make_ready_future<>();
@@ -1351,11 +1382,8 @@ make_file_impl(int fd, file_open_options options, int flags, struct stat st) noe
                 fsi.append_concurrency = 0;
                 fsi.fsync_is_exclusive = true;
             }
-            if (fs_nowait_works && engine()._cfg.aio_nowait_works) {
-                fsi.nowait_works = nowait_mode::yes;
-            } else {
-                fsi.nowait_works = nowait_mode::no;
-            }
+
+            fsi.nowait_works = filesystem_nowait_mode(fs_nowait_works, engine()._cfg.aio_nowait_works);
             fsi.align = filesystem_alignments(fd, st.st_dev, fsi.block_size, sfs.f_type);
             s_fstype.insert(std::make_pair(st.st_dev, std::move(fsi)));
             return make_file_impl(fd, std::move(options), flags, std::move(st));
