@@ -133,7 +133,7 @@ file_handle::to_file() && {
 }
 
 posix_file_impl::posix_file_impl(int fd, open_flags f, file_open_options options, dev_t device_id, const internal::fs_info& fsi)
-        : _nowait_works(fsi.nowait_works)
+        : _nowait_works(fsi.nowait_works ? nowait_mode::yes : nowait_mode::no)
         , _durable(options.durable)
         , _aio_fdatasync(engine().have_aio_fdatasync())
         , _device_id(device_id)
@@ -189,7 +189,7 @@ posix_file_impl::posix_file_impl(int fd, open_flags f, std::atomic<unsigned>* re
         uint32_t disk_read_dma_alignment,
         uint32_t disk_write_dma_alignment,
         uint32_t disk_overwrite_dma_alignment,
-        bool nowait_works, bool durable, bool aio_fdatasync)
+        nowait_mode nowait_works, bool durable, bool aio_fdatasync)
         : _refcount(refcount)
         , _nowait_works(nowait_works)
         , _durable(durable)
@@ -566,27 +566,27 @@ posix_file_impl::list_directory(std::function<future<> (directory_entry de)> nex
 
 future<size_t>
 posix_file_impl::do_write_dma(uint64_t pos, const void* buffer, size_t len, io_intent* intent) noexcept {
-    auto req = internal::io_request::make_write(_fd, pos, buffer, len, _nowait_works);
+    auto req = internal::io_request::make_write(_fd, pos, buffer, len, _nowait_works == nowait_mode::yes);
     return _io_queue.submit_io_write(len, std::move(req), intent);
 }
 
 future<size_t>
 posix_file_impl::do_write_dma(uint64_t pos, std::vector<iovec> iov, io_intent* intent) noexcept {
     auto len = internal::sanitize_iovecs(iov, _disk_write_dma_alignment);
-    auto req = internal::io_request::make_writev(_fd, pos, iov, _nowait_works);
+    auto req = internal::io_request::make_writev(_fd, pos, iov, _nowait_works == nowait_mode::yes);
     return _io_queue.submit_io_write(len, std::move(req), intent, std::move(iov));
 }
 
 future<size_t>
 posix_file_impl::do_read_dma(uint64_t pos, void* buffer, size_t len, io_intent* intent) noexcept {
-    auto req = internal::io_request::make_read(_fd, pos, buffer, len, _nowait_works);
+    auto req = internal::io_request::make_read(_fd, pos, buffer, len, _nowait_works == nowait_mode::yes);
     return _io_queue.submit_io_read(len, std::move(req), intent);
 }
 
 future<size_t>
 posix_file_impl::do_read_dma(uint64_t pos, std::vector<iovec> iov, io_intent* intent) noexcept {
     auto len = internal::sanitize_iovecs(iov, _disk_read_dma_alignment);
-    auto req = internal::io_request::make_readv(_fd, pos, iov, _nowait_works);
+    auto req = internal::io_request::make_readv(_fd, pos, iov, _nowait_works == nowait_mode::yes);
     return _io_queue.submit_io_read(len, std::move(req), intent, std::move(iov));
 }
 
