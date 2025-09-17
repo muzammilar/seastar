@@ -100,7 +100,7 @@ struct fs_info {
     bool append_challenged;
     unsigned append_concurrency;
     bool fsync_is_exclusive;
-    bool nowait_works;
+    nowait_mode nowait_works;
     std::optional<alignments> align;
 };
 
@@ -133,7 +133,7 @@ file_handle::to_file() && {
 }
 
 posix_file_impl::posix_file_impl(int fd, open_flags f, file_open_options options, dev_t device_id, const internal::fs_info& fsi)
-        : _nowait_works(fsi.nowait_works ? nowait_mode::yes : nowait_mode::no)
+        : _nowait_works(fsi.nowait_works)
         , _durable(options.durable)
         , _aio_fdatasync(engine().have_aio_fdatasync())
         , _device_id(device_id)
@@ -1287,7 +1287,7 @@ make_file_impl(int fd, file_open_options options, int flags, struct stat st) noe
             auto align = blkdev_alignments(fd, st.st_rdev);
             internal::fs_info fsi;
             fsi.block_size = align.disk_read; // use logical_block_size for block_size
-            fsi.nowait_works = blockdev_nowait_works(st.st_rdev);
+            fsi.nowait_works = blockdev_nowait_works(st.st_rdev) ? nowait_mode::yes : nowait_mode::no;
             fsi.align = align;
             return make_ready_future<shared_ptr<file_impl>>(make_shared<blockdev_file_impl>(fd, open_flags(flags), options, fsi, st.st_rdev));
         } catch (...) {
@@ -1300,7 +1300,7 @@ make_file_impl(int fd, file_open_options options, int flags, struct stat st) noe
         // query it here. Just provide something reasonable.
         internal::fs_info fsi;
         fsi.block_size = 4096;
-        fsi.nowait_works = false;
+        fsi.nowait_works = nowait_mode::no;
         return make_ready_future<shared_ptr<file_impl>>(make_shared<posix_file_real_impl>(fd, open_flags(flags), options, fsi, st.st_dev));
     }
 
@@ -1312,31 +1312,32 @@ make_file_impl(int fd, file_open_options options, int flags, struct stat st) noe
         return engine().fstatfs(fd).then([fd, options = std::move(options), flags, st = std::move(st)] (struct statfs sfs) {
             internal::fs_info fsi;
             fsi.block_size = sfs.f_bsize;
+            bool fs_nowait_works = false;
             switch (sfs.f_type) {
             case internal::fs_magic::xfs:
                 fsi.append_challenged = true;
                 static auto xc = xfs_concurrency_from_kernel_version();
                 fsi.append_concurrency = xc;
                 fsi.fsync_is_exclusive = true;
-                fsi.nowait_works = internal::kernel_uname().whitelisted({"4.13"});
+                fs_nowait_works = internal::kernel_uname().whitelisted({"4.13"});
                 break;
             case internal::fs_magic::nfs:
                 fsi.append_challenged = false;
                 fsi.append_concurrency = 0;
                 fsi.fsync_is_exclusive = false;
-                fsi.nowait_works = internal::kernel_uname().whitelisted({"4.13"});
+                fs_nowait_works = internal::kernel_uname().whitelisted({"4.13"});
                 break;
             case internal::fs_magic::ext4:
                 fsi.append_challenged = true;
                 fsi.append_concurrency = 0;
                 fsi.fsync_is_exclusive = false;
-                fsi.nowait_works = internal::kernel_uname().whitelisted({"5.5"});
+                fs_nowait_works = internal::kernel_uname().whitelisted({"5.5"});
                 break;
             case internal::fs_magic::btrfs:
                 fsi.append_challenged = true;
                 fsi.append_concurrency = 0;
                 fsi.fsync_is_exclusive = true;
-                fsi.nowait_works = internal::kernel_uname().whitelisted({"5.9"});
+                fs_nowait_works = internal::kernel_uname().whitelisted({"5.9"});
                 break;
             case internal::fs_magic::tmpfs:
             case internal::fs_magic::fuse:
@@ -1344,15 +1345,17 @@ make_file_impl(int fd, file_open_options options, int flags, struct stat st) noe
                 fsi.append_challenged = false;
                 fsi.append_concurrency = 999;
                 fsi.fsync_is_exclusive = false;
-                fsi.nowait_works = false;
                 break;
             default:
                 fsi.append_challenged = true;
                 fsi.append_concurrency = 0;
                 fsi.fsync_is_exclusive = true;
-                fsi.nowait_works = false;
             }
-            fsi.nowait_works &= engine()._cfg.aio_nowait_works;
+            if (fs_nowait_works && engine()._cfg.aio_nowait_works) {
+                fsi.nowait_works = nowait_mode::yes;
+            } else {
+                fsi.nowait_works = nowait_mode::no;
+            }
             fsi.align = filesystem_alignments(fd, st.st_dev, fsi.block_size, sfs.f_type);
             s_fstype.insert(std::make_pair(st.st_dev, std::move(fsi)));
             return make_file_impl(fd, std::move(options), flags, std::move(st));
@@ -1643,7 +1646,7 @@ make_append_challenged_posix_file(file_desc& fd, unsigned concurrency, bool fsyn
         .append_challenged = true,
         .append_concurrency = concurrency,
         .fsync_is_exclusive = fsync_is_exclusive,
-        .nowait_works = true,
+        .nowait_works = nowait_mode::yes,
         .align = std::nullopt,
     };
     // device number can be any value, reactor would just pick "fallback" queue
