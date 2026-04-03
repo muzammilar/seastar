@@ -1289,14 +1289,11 @@ SEASTAR_THREAD_TEST_CASE(test_lz4_fragmented_compressor) {
     test_compressor([] { return std::make_unique<rpc::lz4_fragmented_compressor>(); });
 }
 
-// Test reproducing issue #671: If timeout is time_point::max(), translating
-// it to relative timeout in the sender and then back in the receiver, when
-// these calculations happen across a millisecond boundary, overflowed the
-// integer and mislead the receiver to think the requested timeout was
-// negative, and cause it drop its response, so the RPC call never completed.
-SEASTAR_TEST_CASE(test_max_absolute_timeout) {
-    // The typical failure of this test is a hang. So we use semaphore to
-    // stop the test either when it succeeds, or after a long enough hang.
+// Helper for tests reproducing max-timeout overflow bugs. The typical failure
+// mode is a hang, so a semaphore watchdog is used to bound the test duration.
+// Registers a simple a+b handler and invokes `body` with the env and client,
+// leaving the timeout type and call pattern to the caller.
+static future<> test_max_timeout(std::function<void(rpc_test_env<>&, test_rpc_proto::client&)> body) {
     auto success = make_lw_shared<bool>(false);
     auto done = make_lw_shared<semaphore>(0);
     auto abrt = make_lw_shared<abort_source>();
@@ -1305,10 +1302,28 @@ SEASTAR_TEST_CASE(test_max_absolute_timeout) {
     }).handle_exception([] (std::exception_ptr) {});
     rpc::client_options co;
     co.send_timeout_data = 1;
-    (void)rpc_test_env<>::do_with_thread(rpc_test_config(), co, [] (rpc_test_env<>& env, test_rpc_proto::client& c1) {
+    (void)rpc_test_env<>::do_with_thread(rpc_test_config(), co, [body] (rpc_test_env<>& env, test_rpc_proto::client& c1) {
         env.register_handler(1, [](int a, int b) {
             return make_ready_future<int>(a+b);
         }).get();
+        body(env, c1);
+    }).then([success, done, abrt] {
+        *success = true;
+        abrt->request_abort();
+        done->signal();
+    });
+    return done->wait().then([done, success] {
+        BOOST_REQUIRE(*success);
+    });
+}
+
+// Test reproducing issue #671: If timeout is time_point::max(), translating
+// it to relative timeout in the sender and then back in the receiver, when
+// these calculations happen across a millisecond boundary, overflowed the
+// integer and mislead the receiver to think the requested timeout was
+// negative, and cause it drop its response, so the RPC call never completed.
+SEASTAR_TEST_CASE(test_max_absolute_timeout) {
+    return test_max_timeout([] (rpc_test_env<>& env, test_rpc_proto::client& c1) {
         auto sum = env.proto().make_client<int (int, int)>(1);
         // The bug only reproduces if the calculation done on the sender
         // and receiver sides, happened across a millisecond boundary.
@@ -1321,13 +1336,6 @@ SEASTAR_TEST_CASE(test_max_absolute_timeout) {
             auto result = sum(c1, rpc::rpc_clock_type::time_point::max(), 2, 3).get();
             BOOST_REQUIRE_EQUAL(result, 2 + 3);
         }
-    }).then([success, done, abrt] {
-        *success = true;
-        abrt->request_abort();
-        done->signal();
-    });
-    return done->wait().then([done, success] {
-        BOOST_REQUIRE(*success);
     });
 }
 
@@ -1335,32 +1343,12 @@ SEASTAR_TEST_CASE(test_max_absolute_timeout) {
 // also works, and again doesn't cause the timeout wrapping around to the
 // past and causing dropped responses.
 SEASTAR_TEST_CASE(test_max_relative_timeout) {
-    // The typical failure of this test is a hang. So we use semaphore to
-    // stop the test either when it succeeds, or after a long enough hang.
-    auto success = make_lw_shared<bool>(false);
-    auto done = make_lw_shared<semaphore>(0);
-    auto abrt = make_lw_shared<abort_source>();
-    (void) seastar::sleep_abortable(std::chrono::seconds(3), *abrt).then([done, success] {
-        done->signal(1);
-    }).handle_exception([] (std::exception_ptr) {});
-    rpc::client_options co;
-    co.send_timeout_data = 1;
-    (void)rpc_test_env<>::do_with_thread(rpc_test_config(), co, [] (rpc_test_env<>& env, test_rpc_proto::client& c1) {
-        env.register_handler(1, [](int a, int b) {
-            return make_ready_future<int>(a+b);
-        }).get();
+    return test_max_timeout([] (rpc_test_env<>& env, test_rpc_proto::client& c1) {
         auto sum = env.proto().make_client<int (int, int)>(1);
         // The following call used to always hang, when max()+now()
         // overflowed and appeared to be a negative timeout.
         auto result = sum(c1, rpc::rpc_clock_type::duration::max(), 2, 3).get();
         BOOST_REQUIRE_EQUAL(result, 2 + 3);
-    }).then([success, done, abrt] {
-        *success = true;
-        abrt->request_abort();
-        done->signal();
-    });
-    return done->wait().then([done, success] {
-        BOOST_REQUIRE(*success);
     });
 }
 
