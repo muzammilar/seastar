@@ -794,7 +794,11 @@ SEASTAR_TEST_CASE(test_rpc_scheduling) {
     });
 }
 
-SEASTAR_THREAD_TEST_CASE(test_rpc_scheduling_connection_based) {
+// Helper for connection-based scheduling tests with a synchronous
+// isolate_connection callback.
+// When test_compat is true, also tests that a client without an isolation
+// cookie falls back to the handler's static scheduling group (sg1).
+static void do_test_rpc_scheduling_connection_based(bool test_compat) {
     auto sg1 = create_scheduling_group("sg1", 100).get();
     auto sg1_kill = defer([&] () noexcept { destroy_scheduling_group(sg1).get(); });
     auto sg2 = create_scheduling_group("sg2", 100).get();
@@ -813,72 +817,48 @@ SEASTAR_THREAD_TEST_CASE(test_rpc_scheduling_connection_based) {
     };
     rpc_test_config cfg;
     cfg.resource_limits = limits;
-    rpc_test_env<>::do_with_thread(cfg, [sg1, sg2] (rpc_test_env<>& env) {
+    rpc_test_env<>::do_with_thread(cfg, [sg1, sg2, test_compat] (rpc_test_env<>& env) {
         rpc::client_options co1;
         co1.isolation_cookie = "sg1";
         test_rpc_proto::client c1(env.proto(), co1, env.make_socket(), ipv4_addr());
         rpc::client_options co2;
         co2.isolation_cookie = "sg2";
         test_rpc_proto::client c2(env.proto(), co2, env.make_socket(), ipv4_addr());
-        env.register_handler(1, [] {
-            return make_ready_future<unsigned>(internal::scheduling_group_index(current_scheduling_group()));
-        }).get();
+        if (test_compat) {
+            // A server that uses sg1 if the client is old (no isolation cookie)
+            env.register_handler(1, sg1, [] () {
+                return make_ready_future<unsigned>(internal::scheduling_group_index(current_scheduling_group()));
+            }).get();
+        } else {
+            env.register_handler(1, [] {
+                return make_ready_future<unsigned>(internal::scheduling_group_index(current_scheduling_group()));
+            }).get();
+        }
         auto call_sg_id = env.proto().make_client<unsigned ()>(1);
         unsigned id;
         id = call_sg_id(c1).get();
         BOOST_REQUIRE(id == internal::scheduling_group_index(sg1));
         id = call_sg_id(c2).get();
         BOOST_REQUIRE(id == internal::scheduling_group_index(sg2));
+        if (test_compat) {
+            // An old client, that doesn't have an isolation cookie
+            rpc::client_options co3;
+            test_rpc_proto::client c3(env.proto(), co3, env.make_socket(), ipv4_addr());
+            id = call_sg_id(c3).get();
+            BOOST_REQUIRE(id == internal::scheduling_group_index(sg1));
+            c3.stop().get();
+        }
         c1.stop().get();
         c2.stop().get();
     }).get();
 }
 
+SEASTAR_THREAD_TEST_CASE(test_rpc_scheduling_connection_based) {
+    do_test_rpc_scheduling_connection_based(false);
+}
+
 SEASTAR_THREAD_TEST_CASE(test_rpc_scheduling_connection_based_compatibility) {
-    auto sg1 = create_scheduling_group("sg1", 100).get();
-    auto sg1_kill = defer([&] () noexcept { destroy_scheduling_group(sg1).get(); });
-    auto sg2 = create_scheduling_group("sg2", 100).get();
-    auto sg2_kill = defer([&] () noexcept { destroy_scheduling_group(sg2).get(); });
-    rpc::resource_limits limits;
-    limits.isolate_connection = [sg1, sg2] (sstring cookie) {
-        auto sg = current_scheduling_group();
-        if (cookie == "sg1") {
-            sg = sg1;
-        } else if (cookie == "sg2") {
-            sg = sg2;
-        }
-        rpc::isolation_config cfg;
-        cfg.sched_group = sg;
-        return cfg;
-    };
-    rpc_test_config cfg;
-    cfg.resource_limits = limits;
-    rpc_test_env<>::do_with_thread(cfg, [sg1, sg2] (rpc_test_env<>& env) {
-        rpc::client_options co1;
-        co1.isolation_cookie = "sg1";
-        test_rpc_proto::client c1(env.proto(), co1, env.make_socket(), ipv4_addr());
-        rpc::client_options co2;
-        co2.isolation_cookie = "sg2";
-        test_rpc_proto::client c2(env.proto(), co2, env.make_socket(), ipv4_addr());
-        // An old client, that doesn't have an isolation cookie
-        rpc::client_options co3;
-        test_rpc_proto::client c3(env.proto(), co3, env.make_socket(), ipv4_addr());
-        // A server that uses sg1 if the client is old
-        env.register_handler(1, sg1, [] () {
-            return make_ready_future<unsigned>(internal::scheduling_group_index(current_scheduling_group()));
-        }).get();
-        auto call_sg_id = env.proto().make_client<unsigned ()>(1);
-        unsigned id;
-        id = call_sg_id(c1).get();
-        BOOST_REQUIRE(id == internal::scheduling_group_index(sg1));
-        id = call_sg_id(c2).get();
-        BOOST_REQUIRE(id == internal::scheduling_group_index(sg2));
-        id = call_sg_id(c3).get();
-        BOOST_REQUIRE(id == internal::scheduling_group_index(sg1));
-        c1.stop().get();
-        c2.stop().get();
-        c3.stop().get();
-    }).get();
+    do_test_rpc_scheduling_connection_based(true);
 }
 
 SEASTAR_THREAD_TEST_CASE(test_rpc_scheduling_connection_based_async) {
