@@ -1937,7 +1937,12 @@ bool reactor_backend_selector::has_enough_aio_nr() {
      * So this method calculates:
      *  Available AIO on the system - (request AIO per-cpu * ncpus)
      */
-    if (aio_max_nr - aio_nr < reactor::max_aio * smp::count) {
+    // FIXME: available() is called during app_template construction, before
+    // smp::configure() runs, so the shard count is not yet known. The old code
+    // read smp::count which was 0 at this point, making this check a no-op.
+    // Pass 0 to preserve that (broken) behavior until the initialization order
+    // is fixed.
+    if (aio_max_nr - aio_nr < reactor::max_aio * 0) {
         return false;
     }
     return true;
