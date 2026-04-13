@@ -415,7 +415,7 @@ test_load_balancing_algorithm_port(socket_address listen_addr, bool proxy_protoc
     };
     auto server = sharded<shard_number_server>();
     server.start(listen_addr, lo).get();
-    auto smp_count = smp::count;
+    auto smp_count = this_smp_shard_count();
     promise<> client_done;
     auto client = std::async(std::launch::async, [&] {
         auto r = client_results{};

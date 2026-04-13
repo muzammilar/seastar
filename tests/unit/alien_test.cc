@@ -95,7 +95,7 @@ int main(int argc, char** argv)
     app.run(argc, argv, [&] {
         return seastar::now().then([engine_ready_fd, &shard_count] {
             // engine ready!
-            shard_count = smp::count;
+            shard_count = this_smp_shard_count();
             ::eventfd_write(engine_ready_fd, ENGINE_READY);
             return seastar::now();
         }).then([alien_done = std::move(alien_done), &result]() mutable {

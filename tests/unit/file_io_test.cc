@@ -118,7 +118,7 @@ SEASTAR_TEST_CASE(file_access_test) {
 // that a file obtained from the handle is the same one, as it was
 // when the file was opened.
 SEASTAR_TEST_CASE(file_ro_dup_test) {
-    if (seastar::smp::count < 2) {
+    if (seastar::this_smp_shard_count() < 2) {
         fmt::print("This test needs at least 2 shards to run\n");
         return make_ready_future<>();
     }
