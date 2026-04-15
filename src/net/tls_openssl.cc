@@ -171,6 +171,10 @@ std::system_error make_openssl_error(const std::string & msg) {
     return make_openssl_error(msg, get_all_openssl_errors());
 }
 
+std::runtime_error make_unknown_openssl_error(const std::string & msg) {
+    return std::runtime_error(fmt::format("{}: {}", msg, get_all_openssl_errors()));
+}
+
 bool contains_openssl_error(const std::vector<openssl_errc> & error_codes, int lib, int reason) {
     return std::any_of(error_codes.cbegin(), error_codes.cend(), [lib, reason](const openssl_errc & code) {
         return ERR_GET_LIB(static_cast<unsigned long>(code)) == lib &&
@@ -917,7 +921,7 @@ public:
         default:
         {
             // Some other unhandled situation
-            auto err = std::runtime_error(
+            auto err = make_unknown_openssl_error(
                 "Unknown error encountered during SSL write");
             return handle_output_error(std::move(err)).then([] {
                 return stop_iteration::yes;
@@ -1102,7 +1106,7 @@ public:
                             return handle_output_error(std::move(err));
                         }
                         default:
-                            auto err = std::runtime_error(
+                            auto err = make_unknown_openssl_error(
                             "Unknown error encountered during handshake");
                             return handle_output_error(std::move(err));
                         }
@@ -1227,7 +1231,7 @@ public:
                         return make_exception_future<buf_type>(_error);
                     }
                 default:
-                    _error = std::make_exception_ptr(std::runtime_error(
+                    _error = std::make_exception_ptr(make_unknown_openssl_error(
                       "Unexpected error condition during SSL read"));
                     return make_exception_future<buf_type>(_error);
                 }
@@ -1312,7 +1316,7 @@ public:
             }
             default:
             {
-                auto err = std::runtime_error(
+                auto err = make_unknown_openssl_error(
                   "Unknown error occurred during SSL shutdown");
                 return handle_output_error(std::move(err));
             }
