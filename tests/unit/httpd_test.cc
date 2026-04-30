@@ -762,32 +762,32 @@ SEASTAR_TEST_CASE(content_length_limit) {
         loopback_connection_factory lcf(1);
         http_server server("test");
         server.set_content_length_limit(11);
-        loopback_socket_impl lsi(lcf);
         httpd::http_server_tester::listeners(server).emplace_back(lcf.get_server_socket());
 
-        future<> client = seastar::async([&lsi] {
-            connected_socket c_socket = lsi.connect(socket_address(ipv4_addr()), socket_address(ipv4_addr())).get();
-            input_stream<char> input(c_socket.input());
-            output_stream<char> output(c_socket.output());
+        future<> client = seastar::async([&lcf] {
+            auto cln = http::client(std::make_unique<loopback_http_factory>(lcf));
+            auto check_status = [&cln] (sstring body, http::reply::status_type expected) {
+                auto req = http::request::make("GET", "test", "/test");
+                if (!body.empty()) {
+                    req.write_body("txt", std::move(body));
+                }
+                std::optional<http::reply::status_type> status;
+                cln.make_request(std::move(req), [&status] (const http::reply& rep, input_stream<char>&& in) {
+                    status = rep._status;
+                    return seastar::async([in = std::move(in)] () mutable {
+                        util::skip_entire_stream(in).get();
+                        in.close().get();
+                    });
+                }).get();
+                BOOST_REQUIRE(status.has_value());
+                BOOST_REQUIRE_EQUAL(status.value(), expected);
+            };
 
-            output.write(sstring("GET /test HTTP/1.1\r\nHost: test\r\n\r\n")).get();
-            output.flush().get();
-            auto resp = input.read().get();
-            BOOST_REQUIRE_NE(std::string(resp.get(), resp.size()).find("200 OK"), std::string::npos);
+            check_status("",                    http::reply::status_type::ok);
+            check_status("xxxxxxxxxxx",         http::reply::status_type::ok);                // 11 bytes, at limit
+            check_status("xxxxxxxxxxxxxxxxx",   http::reply::status_type::payload_too_large); // 17 bytes, over limit
 
-            output.write(sstring("GET /test HTTP/1.1\r\nHost: test\r\nContent-Length: 11\r\n\r\nxxxxxxxxxxx")).get();
-            output.flush().get();
-            resp = input.read().get();
-            BOOST_REQUIRE_NE(std::string(resp.get(), resp.size()).find("200 OK"), std::string::npos);
-
-            output.write(sstring("GET /test HTTP/1.1\r\nHost: test\r\nContent-Length: 17\r\n\r\nxxxxxxxxxxxxxxxx")).get();
-            output.flush().get();
-            resp = input.read().get();
-            BOOST_REQUIRE_EQUAL(std::string(resp.get(), resp.size()).find("200 OK"), std::string::npos);
-            BOOST_REQUIRE_NE(std::string(resp.get(), resp.size()).find("413 Payload Too Large"), std::string::npos);
-
-            input.close().get();
-            output.close().get();
+            cln.close().get();
         });
 
         auto handler = new json_test_handler(json::stream_object("hello"));
