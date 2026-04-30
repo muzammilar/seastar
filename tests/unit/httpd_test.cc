@@ -5,6 +5,8 @@
 #include <seastar/http/function_handlers.hh>
 #include <seastar/http/httpd.hh>
 #include <seastar/http/handlers.hh>
+#include <seastar/http/common.hh>
+#include <seastar/util/memory-data-sink.hh>
 #include <seastar/http/matcher.hh>
 #include <seastar/http/matchrules.hh>
 #include <seastar/http/reply.hh>
@@ -655,6 +657,48 @@ SEASTAR_TEST_CASE(test_simple_chunked) {
     return test_client_server::run(tests);
 }
 
+#if SEASTAR_API_LEVEL >= 9
+// Verify that http_chunked_data_sink_impl emits one chunk per put() call
+// even when the put receives multiple buffers, and that the chunk size
+// header and trailing CRLF frame the output correctly. Each chunked.write()
+// hands in a span of two buffers of differing sizes, and flush() forces it
+// down to the chunked sink as a single put() call. With a fallback
+// (per-buffer) implementation this would produce four chunks instead of
+// two, and the equality check below would fail.
+SEASTAR_TEST_CASE(test_chunked_sink_two_chunks_two_bufs) {
+    return seastar::async([] {
+        std::stringstream ss;
+        output_stream<char> raw_out(testing::memory_data_sink(ss), 4096);
+        auto chunked = http::internal::make_http_chunked_output_stream(raw_out);
+
+        const std::string A = "AAAAAAA";
+        const std::string B = "BBBBBBBBBBBBBBBBBBBBBBBB";
+        const std::string C = "C";
+        const std::string D = "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
+
+        std::array<temporary_buffer<char>, 2> chunk1{
+                temporary_buffer<char>::copy_of(A),
+                temporary_buffer<char>::copy_of(B)};
+        chunked.write(std::span<temporary_buffer<char>>(chunk1)).get();
+        chunked.flush().get();
+
+        std::array<temporary_buffer<char>, 2> chunk2{
+                temporary_buffer<char>::copy_of(C),
+                temporary_buffer<char>::copy_of(D)};
+        chunked.write(std::span<temporary_buffer<char>>(chunk2)).get();
+        chunked.flush().get();
+
+        chunked.close().get();
+        raw_out.close().get();
+
+        const std::string expected =
+                  format("{:x}", A.size() + B.size()) + "\r\n" + A + B + "\r\n"
+                + format("{:x}", C.size() + D.size()) + "\r\n" + C + D + "\r\n";
+        BOOST_REQUIRE_EQUAL(ss.str(), expected);
+    });
+}
+#endif
+
 SEASTAR_TEST_CASE(test_http_client_server_full) {
     std::vector<std::tuple<bool, size_t>> tests = {
         std::make_tuple(true, 100),
@@ -762,32 +806,32 @@ SEASTAR_TEST_CASE(content_length_limit) {
         loopback_connection_factory lcf(1);
         http_server server("test");
         server.set_content_length_limit(11);
-        loopback_socket_impl lsi(lcf);
         httpd::http_server_tester::listeners(server).emplace_back(lcf.get_server_socket());
 
-        future<> client = seastar::async([&lsi] {
-            connected_socket c_socket = lsi.connect(socket_address(ipv4_addr()), socket_address(ipv4_addr())).get();
-            input_stream<char> input(c_socket.input());
-            output_stream<char> output(c_socket.output());
+        future<> client = seastar::async([&lcf] {
+            auto cln = http::client(std::make_unique<loopback_http_factory>(lcf));
+            auto check_status = [&cln] (sstring body, http::reply::status_type expected) {
+                auto req = http::request::make("GET", "test", "/test");
+                if (!body.empty()) {
+                    req.write_body("txt", std::move(body));
+                }
+                std::optional<http::reply::status_type> status;
+                cln.make_request(std::move(req), [&status] (const http::reply& rep, input_stream<char>&& in) {
+                    status = rep._status;
+                    return seastar::async([in = std::move(in)] () mutable {
+                        util::skip_entire_stream(in).get();
+                        in.close().get();
+                    });
+                }).get();
+                BOOST_REQUIRE(status.has_value());
+                BOOST_REQUIRE_EQUAL(status.value(), expected);
+            };
 
-            output.write(sstring("GET /test HTTP/1.1\r\nHost: test\r\n\r\n")).get();
-            output.flush().get();
-            auto resp = input.read().get();
-            BOOST_REQUIRE_NE(std::string(resp.get(), resp.size()).find("200 OK"), std::string::npos);
+            check_status("",                    http::reply::status_type::ok);
+            check_status("xxxxxxxxxxx",         http::reply::status_type::ok);                // 11 bytes, at limit
+            check_status("xxxxxxxxxxxxxxxxx",   http::reply::status_type::payload_too_large); // 17 bytes, over limit
 
-            output.write(sstring("GET /test HTTP/1.1\r\nHost: test\r\nContent-Length: 11\r\n\r\nxxxxxxxxxxx")).get();
-            output.flush().get();
-            resp = input.read().get();
-            BOOST_REQUIRE_NE(std::string(resp.get(), resp.size()).find("200 OK"), std::string::npos);
-
-            output.write(sstring("GET /test HTTP/1.1\r\nHost: test\r\nContent-Length: 17\r\n\r\nxxxxxxxxxxxxxxxx")).get();
-            output.flush().get();
-            resp = input.read().get();
-            BOOST_REQUIRE_EQUAL(std::string(resp.get(), resp.size()).find("200 OK"), std::string::npos);
-            BOOST_REQUIRE_NE(std::string(resp.get(), resp.size()).find("413 Payload Too Large"), std::string::npos);
-
-            input.close().get();
-            output.close().get();
+            cln.close().get();
         });
 
         auto handler = new json_test_handler(json::stream_object("hello"));
