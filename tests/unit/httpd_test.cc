@@ -5,6 +5,8 @@
 #include <seastar/http/function_handlers.hh>
 #include <seastar/http/httpd.hh>
 #include <seastar/http/handlers.hh>
+#include <seastar/http/common.hh>
+#include <seastar/util/memory-data-sink.hh>
 #include <seastar/http/matcher.hh>
 #include <seastar/http/matchrules.hh>
 #include <seastar/http/reply.hh>
@@ -654,6 +656,48 @@ SEASTAR_TEST_CASE(test_simple_chunked) {
         std::make_tuple(true, 100)};
     return test_client_server::run(tests);
 }
+
+#if SEASTAR_API_LEVEL >= 9
+// Verify that http_chunked_data_sink_impl emits one chunk per put() call
+// even when the put receives multiple buffers, and that the chunk size
+// header and trailing CRLF frame the output correctly. Each chunked.write()
+// hands in a span of two buffers of differing sizes, and flush() forces it
+// down to the chunked sink as a single put() call. With a fallback
+// (per-buffer) implementation this would produce four chunks instead of
+// two, and the equality check below would fail.
+SEASTAR_TEST_CASE(test_chunked_sink_two_chunks_two_bufs) {
+    return seastar::async([] {
+        std::stringstream ss;
+        output_stream<char> raw_out(testing::memory_data_sink(ss), 4096);
+        auto chunked = http::internal::make_http_chunked_output_stream(raw_out);
+
+        const std::string A = "AAAAAAA";
+        const std::string B = "BBBBBBBBBBBBBBBBBBBBBBBB";
+        const std::string C = "C";
+        const std::string D = "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
+
+        std::array<temporary_buffer<char>, 2> chunk1{
+                temporary_buffer<char>::copy_of(A),
+                temporary_buffer<char>::copy_of(B)};
+        chunked.write(std::span<temporary_buffer<char>>(chunk1)).get();
+        chunked.flush().get();
+
+        std::array<temporary_buffer<char>, 2> chunk2{
+                temporary_buffer<char>::copy_of(C),
+                temporary_buffer<char>::copy_of(D)};
+        chunked.write(std::span<temporary_buffer<char>>(chunk2)).get();
+        chunked.flush().get();
+
+        chunked.close().get();
+        raw_out.close().get();
+
+        const std::string expected =
+                  format("{:x}", A.size() + B.size()) + "\r\n" + A + B + "\r\n"
+                + format("{:x}", C.size() + D.size()) + "\r\n" + C + D + "\r\n";
+        BOOST_REQUIRE_EQUAL(ss.str(), expected);
+    });
+}
+#endif
 
 SEASTAR_TEST_CASE(test_http_client_server_full) {
     std::vector<std::tuple<bool, size_t>> tests = {
