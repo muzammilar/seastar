@@ -246,6 +246,9 @@ using seastar::reactor;
 using seastar::engine;
 using seastar::local_engine;
 using seastar::smp;
+using seastar::this_smp;
+using seastar::this_smp_shard_count;
+using seastar::this_smp_all_shards;
 using seastar::shard_id;
 using seastar::this_shard_id;
 

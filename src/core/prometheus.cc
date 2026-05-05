@@ -563,8 +563,8 @@ public:
 
 static future<metrics_families_per_shard> get_map_value() {
     metrics_families_per_shard vec;
-    vec.resize(smp::count);
-    co_await parallel_for_each(std::views::iota(0u, smp::count), [&vec] (auto cpu) {
+    vec.resize(this_smp_shard_count());
+    co_await parallel_for_each(std::views::iota(0u, this_smp_shard_count()), [&vec] (auto cpu) {
         return smp::submit_to(cpu, [] {
             return mi::get_values();
         }).then([&vec, cpu] (auto res) {
@@ -757,7 +757,7 @@ class metric_family_range {
     metric_family_iterator _begin;
     metric_family_iterator _end;
 public:
-    metric_family_range(const metrics_families_per_shard& families) : _begin(families, smp::count),
+    metric_family_range(const metrics_families_per_shard& families) : _begin(families, this_smp_shard_count()),
         _end(metric_family_iterator(families, 0))
     {
     }
@@ -777,7 +777,7 @@ public:
 
 metric_family_iterator metrics_families_per_shard::find_bound(const sstring& family_name, comp_function comp) const {
     std::vector<size_t> positions;
-    positions.reserve(smp::count);
+    positions.reserve(this_smp_shard_count());
 
     for (auto& shard_info : _data) {
         std::vector<mi::metric_family_metadata>& metadata = *(shard_info->metadata);

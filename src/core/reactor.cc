@@ -4072,11 +4072,12 @@ thread_local std::unique_ptr<reactor, reactor_deleter> reactor_holder;
 
 thread_local smp_message_queue** smp::_qs;
 thread_local std::thread::id smp::_tmain;
+
 unsigned smp::count = 0;
 
 void smp::start_all_queues()
 {
-    for (unsigned c = 0; c < count; c++) {
+    for (unsigned c = 0; c < _shard_count; c++) {
         if (c != this_shard_id()) {
             _qs[c][this_shard_id()].start(c);
         }
@@ -4146,7 +4147,7 @@ void smp::cleanup_cpu() {
     size_t cpuid = this_shard_id();
 
     if (_qs) {
-        for(unsigned i = 0; i < smp::count; i++) {
+        for(unsigned i = 0; i < _shard_count; i++) {
             _qs[i][cpuid].stop();
         }
     }
@@ -4265,8 +4266,8 @@ void install_oneshot_signal_handler<SIGSEGV, sigsegv_action>() {
 #endif
 
 void smp::qs_deleter::operator()(smp_message_queue** qs) const {
-    for (unsigned i = 0; i < smp::count; i++) {
-        for (unsigned j = 0; j < smp::count; j++) {
+    for (unsigned i = 0; i < this_smp_shard_count(); i++) {
+        for (unsigned j = 0; j < this_smp_shard_count(); j++) {
             qs[i][j].~smp_message_queue();
         }
         ::operator delete[](qs[i], std::align_val_t(alignof(smp_message_queue))
@@ -4275,15 +4276,17 @@ void smp::qs_deleter::operator()(smp_message_queue** qs) const {
     delete[](qs);
 }
 
+
+
 void smp::log_aiocbs(log_level level, unsigned storage, unsigned preempt, unsigned network, unsigned reserve) {
     // Each cell in the table should be
     // - as wide as the grand total,
     // - as wide as its containing column's header,
     // whichever is wider.
     std::string percpu_hdr = format("per cpu");
-    std::string allcpus_hdr = format("all {} cpus", smp::count);
+    std::string allcpus_hdr = format("all {} cpus", _shard_count);
     unsigned percpu_total = storage + preempt + network;
-    unsigned allcpus_total = reserve + percpu_total * smp::count;
+    unsigned allcpus_total = reserve + percpu_total * _shard_count;
     size_t num_width = format("{}", allcpus_total).length();
     size_t percpu_width = std::max(num_width, percpu_hdr.length());
     size_t allcpus_width = std::max(num_width, allcpus_hdr.length());
@@ -4291,9 +4294,9 @@ void smp::log_aiocbs(log_level level, unsigned storage, unsigned preempt, unsign
     seastar_logger.log(level, "purpose  {:{}}  {:{}}",     percpu_hdr,   percpu_width, allcpus_hdr,          allcpus_width);
     seastar_logger.log(level, "-------  {:-<{}}  {:-<{}}", "",           percpu_width, "",                   allcpus_width);
     seastar_logger.log(level, "reserve  {:{}}  {:{}}",     "",           percpu_width, reserve,              allcpus_width);
-    seastar_logger.log(level, "storage  {:{}}  {:{}}",     storage,      percpu_width, storage * smp::count, allcpus_width);
-    seastar_logger.log(level, "preempt  {:{}}  {:{}}",     preempt,      percpu_width, preempt * smp::count, allcpus_width);
-    seastar_logger.log(level, "network  {:{}}  {:{}}",     network,      percpu_width, network * smp::count, allcpus_width);
+    seastar_logger.log(level, "storage  {:{}}  {:{}}",     storage,      percpu_width, storage * _shard_count, allcpus_width);
+    seastar_logger.log(level, "preempt  {:{}}  {:{}}",     preempt,      percpu_width, preempt * _shard_count, allcpus_width);
+    seastar_logger.log(level, "network  {:{}}  {:{}}",     network,      percpu_width, network * _shard_count, allcpus_width);
     seastar_logger.log(level, "-------  {:-<{}}  {:-<{}}", "",           percpu_width, "",                   allcpus_width);
     seastar_logger.log(level, "total    {:{}}  {:{}}",     percpu_total, percpu_width, allcpus_total,        allcpus_width);
 }
@@ -4306,8 +4309,8 @@ unsigned smp::adjust_max_networking_aio_io_control_blocks(unsigned network_iocbs
     auto aio_max_nr = read_first_line_as<unsigned>("/proc/sys/fs/aio-max-nr");
     auto aio_nr = read_first_line_as<unsigned>("/proc/sys/fs/aio-nr");
     auto available_aio = aio_max_nr - aio_nr;
-    auto requested_aio_network = network_iocbs * smp::count;
-    auto requested_aio_other = reserve_iocbs + (storage_iocbs + preempt_iocbs) * smp::count;
+    auto requested_aio_network = network_iocbs * _shard_count;
+    auto requested_aio_other = reserve_iocbs + (storage_iocbs + preempt_iocbs) * _shard_count;
     auto requested_aio = requested_aio_network + requested_aio_other;
 
     seastar_logger.debug("Intended AIO control block usage:");
@@ -4317,8 +4320,8 @@ unsigned smp::adjust_max_networking_aio_io_control_blocks(unsigned network_iocbs
     seastar_logger.debug("Available AIO control blocks = aio-max-nr - aio-nr = {} - {} = {}", aio_max_nr, aio_nr, available_aio);
 
     if (available_aio < requested_aio) {
-        if (available_aio >= requested_aio_other + smp::count) { // at least one queue for each shard
-            network_iocbs = (available_aio - requested_aio_other) / smp::count;
+        if (available_aio >= requested_aio_other + _shard_count) { // at least one queue for each shard
+            network_iocbs = (available_aio - requested_aio_other) / _shard_count;
             seastar_logger.warn("Your system does not have enough AIO capacity for optimal network performance; reducing `max-networking-io-control-blocks'.");
             seastar_logger.warn("Resultant AIO control block usage:");
             seastar_logger.warn("");
@@ -4329,7 +4332,7 @@ unsigned smp::adjust_max_networking_aio_io_control_blocks(unsigned network_iocbs
             throw std::runtime_error(
                 format("Your system does not satisfy minimum AIO requirements. "
                        "Set /proc/sys/fs/aio-max-nr to at least {} (minimum) or {} (recommended for networking performance).",
-                       aio_nr + (requested_aio_other + smp::count), aio_nr + requested_aio));
+                       aio_nr + (requested_aio_other + _shard_count), aio_nr + requested_aio));
         }
     }
 
@@ -4416,11 +4419,17 @@ void smp::configure(const smp_options& smp_opts, const reactor_options& reactor_
     }
 
     if (smp_opts.smp) {
-        smp::count = smp_opts.smp.get_value();
+        _shard_count = smp_opts.smp.get_value();
     } else {
-        smp::count = cpu_set.size();
+        _shard_count = cpu_set.size();
     }
-    std::vector<reactor*> reactors(smp::count);
+
+    // For compatiblity, set smp::count, but don't warn about it.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    smp::count = _shard_count;
+#pragma GCC diagnostic pop
+    std::vector<reactor*> reactors(_shard_count);
     if (smp_opts.memory) {
 #ifdef SEASTAR_DEFAULT_ALLOCATOR
         seastar_logger.warn("Seastar compiled with default allocator, --memory option won't take effect");
@@ -4430,7 +4439,7 @@ void smp::configure(const smp_options& smp_opts, const reactor_options& reactor_
         if (smp_opts.hugepages &&
             !reactor_opts.network_stack.get_selected_candidate_name().compare("native") &&
             _using_dpdk) {
-            size_t dpdk_memory = dpdk::eal::mem_size(smp::count);
+            size_t dpdk_memory = dpdk::eal::mem_size(_shard_count);
 
             if (dpdk_memory >= rc.total_memory) {
                 seastar_logger.error("Can't run with the given amount of memory: {}. "
@@ -4477,7 +4486,7 @@ void smp::configure(const smp_options& smp_opts, const reactor_options& reactor_
         }
     }
 
-    rc.cpus = smp::count;
+    rc.cpus = _shard_count;
     rc.cpu_set = std::move(cpu_set);
 
     internal::disk_config_params disk_config(reactor::max_queues);
@@ -4494,7 +4503,7 @@ void smp::configure(const smp_options& smp_opts, const reactor_options& reactor_
 #endif
 
     auto resources = resource::allocate(rc);
-    logger::set_shard_field_width(std::ceil(std::log10(smp::count)));
+    logger::set_shard_field_width(std::ceil(std::log10(_shard_count)));
     std::vector<resource::cpu> allocations = std::move(resources.cpus);
     if (thread_affinity) {
         smp::pin(allocations[0].cpu_id);
@@ -4509,8 +4518,8 @@ void smp::configure(const smp_options& smp_opts, const reactor_options& reactor_
         memory::configure_minimal();
     }
 
-    _shard_to_numa_node_mapping.reserve(smp::count);
-    for (unsigned i = 0; i < smp::count; i++) {
+    _shard_to_numa_node_mapping.reserve(_shard_count);
+    for (unsigned i = 0; i < _shard_count; i++) {
         _shard_to_numa_node_mapping.push_back(allocations[i].mem.size() > 0 ? allocations[i].mem[0].nodeid : 0);
     }
 
@@ -4592,11 +4601,11 @@ void smp::configure(const smp_options& smp_opts, const reactor_options& reactor_
 #endif
 
     // Better to put it into the smp class, but at smp construction time
-    // correct smp::count is not known.
-    std::barrier reactors_registered(smp::count);
-    std::barrier smp_queues_constructed(smp::count);
+    // correct _shard_count is not known.
+    std::barrier reactors_registered(_shard_count);
+    std::barrier smp_queues_constructed(_shard_count);
     // We use shared_ptr since this thread can exit while other threads are still unlocking
-    auto inited = std::make_shared<std::barrier<>>(smp::count);
+    auto inited = std::make_shared<std::barrier<>>(_shard_count);
 
     auto ioq_topology = std::move(resources.ioq_topology);
 
@@ -4649,12 +4658,12 @@ void smp::configure(const smp_options& smp_opts, const reactor_options& reactor_
         }
     };
 
-    _all_event_loops_done.emplace(smp::count);
+    _all_event_loops_done.emplace(_shard_count);
 
     auto backend_selector = reactor_opts.reactor_backend.get_selected_candidate();
     seastar_logger.info("Reactor backend: {}", backend_selector);
 
-    _qs_owner = decltype(smp::_qs_owner){new smp_message_queue* [smp::count], qs_deleter{}};
+    _qs_owner = decltype(smp::_qs_owner){new smp_message_queue* [_shard_count], qs_deleter{}};
 
     auto allocate_qs_owner = [this] (unsigned i) {
         // smp_message_queue has members with hefty alignment requirements.
@@ -4662,25 +4671,27 @@ void smp::configure(const smp_options& smp_opts, const reactor_options& reactor_
         // new default aligned seemingly works, as does reordering
         // dlinit dependencies (ugh). But we should enforce calling out to
         // aligned_alloc, instead of pure malloc, if possible.
-        smp::_qs_owner[i] = reinterpret_cast<smp_message_queue*>(operator new[] (sizeof(smp_message_queue) * smp::count
+        smp::_qs_owner[i] = reinterpret_cast<smp_message_queue*>(operator new[] (sizeof(smp_message_queue) * _shard_count
             , std::align_val_t(alignof(smp_message_queue))
         ));
     };
 
     auto allocate_smp_queues = [this, &reactors] (unsigned i) {
-        for (unsigned j = 0; j < smp::count; ++j) {
+        for (unsigned j = 0; j < _shard_count; ++j) {
             new (&smp::_qs_owner[i][j]) smp_message_queue(reactors[j], reactors[i]);
         }
     };
 
     unsigned i;
     auto smp_tmain = smp::_tmain;
-    for (i = 1; i < smp::count; i++) {
+    smp::_this_smp = this;
+    for (i = 1; i < _shard_count; i++) {
         auto allocation = allocations[i];
         create_thread([this, smp_tmain, inited, &reactors_registered, &smp_queues_constructed, &smp_opts, &reactor_opts, &reactors, hugepages_path, i, allocation, assign_io_queues, alloc_io_queues, thread_affinity, heapprof_sampling_rate, mbind, backend_selector, reactor_cfg, &mtx, &layout, use_transparent_hugepages, allocate_qs_owner, allocate_smp_queues] {
           try {
             // initialize thread_locals that are equal across all reacto threads of this smp instance
             smp::_tmain = smp_tmain;
+            smp::_this_smp = this;
             auto thread_name = fmt::format("reactor-{}", i);
             pthread_setname_np(pthread_self(), thread_name.c_str());
             if (thread_affinity) {
@@ -4766,7 +4777,7 @@ void smp::configure(const smp_options& smp_opts, const reactor_options& reactor_
 
 bool smp::poll_queues() {
     size_t got = 0;
-    for (unsigned i = 0; i < count; i++) {
+    for (unsigned i = 0; i < this_smp_shard_count(); i++) {
         if (this_shard_id() != i) {
             auto& rxq = _qs[this_shard_id()][i];
             rxq.flush_response_batch();
@@ -4781,7 +4792,7 @@ bool smp::poll_queues() {
 }
 
 bool smp::pure_poll_queues() {
-    for (unsigned i = 0; i < count; i++) {
+    for (unsigned i = 0; i < this_smp_shard_count(); i++) {
         if (this_shard_id() != i) {
             auto& rxq = _qs[this_shard_id()][i];
             rxq.flush_response_batch();
