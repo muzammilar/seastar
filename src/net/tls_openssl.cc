@@ -171,6 +171,10 @@ std::system_error make_openssl_error(const std::string & msg) {
     return make_openssl_error(msg, get_all_openssl_errors());
 }
 
+std::runtime_error make_unknown_openssl_error(const std::string & msg) {
+    return std::runtime_error(fmt::format("{}: {}", msg, get_all_openssl_errors()));
+}
+
 bool contains_openssl_error(const std::vector<openssl_errc> & error_codes, int lib, int reason) {
     return std::any_of(error_codes.cbegin(), error_codes.cend(), [lib, reason](const openssl_errc & code) {
         return ERR_GET_LIB(static_cast<unsigned long>(code)) == lib &&
@@ -789,7 +793,7 @@ public:
         bio_ptr in_bio(BIO_new(get_method()));
         bio_ptr out_bio(BIO_new(get_method()));
         if (!in_bio || !out_bio) {
-            throw std::runtime_error("Failed to create BIOs");
+            throw make_openssl_error("Failed to create BIOs");
         }
         if (1 != BIO_ctrl(in_bio.get(), BIO_C_SET_POINTER, 0, this)) {
             throw make_openssl_error("Failed to set bio ptr to in bio");
@@ -917,7 +921,7 @@ public:
         default:
         {
             // Some other unhandled situation
-            auto err = std::runtime_error(
+            auto err = make_unknown_openssl_error(
                 "Unknown error encountered during SSL write");
             return handle_output_error(std::move(err)).then([] {
                 return stop_iteration::yes;
@@ -957,6 +961,7 @@ public:
         // This do_until runs until either a renegotiation occurs or the packet is empty
         while (!eof() && size > 0) {
             size_t bytes_written = 0;
+            verify_clean_error_queue("SSL_write_ex");
             auto write_rc = SSL_write_ex(_ssl.get(), ptr, size, &bytes_written);
             tls_log.trace("{} do_put: SSL_write_ex: {}", *this, write_rc);
             if (write_rc != 1) {
@@ -967,6 +972,7 @@ public:
                     co_return;
                 }
             } else {
+                clear_stale_ssl_errors("SSL_write_ex");
                 SEASTAR_ASSERT(bytes_written <= size);
                 tls_log.trace("{} do_put: bytes_written: {}", *this, bytes_written);
                 ptr += bytes_written;
@@ -1048,6 +1054,7 @@ public:
             [this] { return connected() || eof(); },
             [this] {
                 try {
+                    verify_clean_error_queue("SSL_do_handshake");
                     auto n = SSL_do_handshake(_ssl.get());
                     tls_log.trace("{} do_handshake: SSL_do_handshake: {}", *this, n);
                     if (n <= 0) {
@@ -1102,11 +1109,12 @@ public:
                             return handle_output_error(std::move(err));
                         }
                         default:
-                            auto err = std::runtime_error(
+                            auto err = make_unknown_openssl_error(
                             "Unknown error encountered during handshake");
                             return handle_output_error(std::move(err));
                         }
                     } else {
+                        clear_stale_ssl_errors("SSL_do_handshake");
                         if (_type == session_type::CLIENT
                             || _creds->get_client_auth() != client_auth::NONE) {
                             verify();
@@ -1169,6 +1177,7 @@ public:
             tls_log.trace("{} do_get: available: {}", *this, avail);
             buf_type buf(avail);
             size_t bytes_read = 0;
+            verify_clean_error_queue("SSL_read_ex");
             auto read_result = SSL_read_ex(
               _ssl.get(), buf.get_write(), avail, &bytes_read);
             tls_log.trace("{} do_get: SSL_read_ex: {}", *this, read_result);
@@ -1227,11 +1236,12 @@ public:
                         return make_exception_future<buf_type>(_error);
                     }
                 default:
-                    _error = std::make_exception_ptr(std::runtime_error(
+                    _error = std::make_exception_ptr(make_unknown_openssl_error(
                       "Unexpected error condition during SSL read"));
                     return make_exception_future<buf_type>(_error);
                 }
             } else {
+                clear_stale_ssl_errors("SSL_read_ex");
                 buf.trim(bytes_read);
                 return make_ready_future<buf_type>(std::move(buf));
             }
@@ -1264,11 +1274,14 @@ public:
             return make_ready_future();
         }
 
+        verify_clean_error_queue("SSL_shutdown");
         auto res = SSL_shutdown(_ssl.get());
         tls_log.trace("{} do_shutdown: SSL_shutdown: {}", *this, res);
         if (res == 1) {
+            clear_stale_ssl_errors("SSL_shutdown");
             return wait_for_output();
         } else if (res == 0) {
+            clear_stale_ssl_errors("SSL_shutdown");
             return yield().then([this] { return do_shutdown(); });
         } else {
             auto ssl_err = SSL_get_error(_ssl.get(), res);
@@ -1312,7 +1325,7 @@ public:
             }
             default:
             {
-                auto err = std::runtime_error(
+                auto err = make_unknown_openssl_error(
                   "Unknown error occurred during SSL shutdown");
                 return handle_output_error(std::move(err));
             }
@@ -1614,6 +1627,32 @@ public:
     }
 
 private:
+    // Some SSL operations return success while leaving stale errors on the
+    // queue (e.g. from internal BIO write failures that OpenSSL absorbed).
+    // Drain them so they don't poison the next operation on this shard.
+    void clear_stale_ssl_errors(const char* operation) {
+        if (ERR_peek_error() == 0) [[likely]] {
+            return;
+        }
+        auto errors = get_all_openssl_errors();
+        tls_log.debug("{} {}: ignoring stale errors on queue: {}", *this, operation, errors);
+    }
+
+    // Checks that the OpenSSL per-thread error queue is clean before
+    // calling an SSL function.  A dirty queue can cause SSL_get_error
+    // to misclassify results (e.g. reporting SSL_ERROR_SYSCALL instead
+    // of SSL_ERROR_SSL), which can affect unrelated sessions that share
+    // the same thread.
+    void verify_clean_error_queue(const char* operation) {
+        auto err = ERR_peek_error();
+        if (err == 0) [[likely]] {
+            return;
+        }
+        char buf[256];
+        ERR_error_string_n(err, buf, sizeof(buf));
+        tls_log.warn("{} stale error on queue before {}: {}", *this, operation, buf);
+    }
+
     std::vector<subject_alt_name> do_get_alt_name_information(const x509_ptr &peer_cert,
                                                               const std::unordered_set<subject_alt_name_type> &types) const {
         int ext_idx = X509_get_ext_by_NID(
@@ -1782,6 +1821,11 @@ private:
             throw make_openssl_error(
               "Failed to initialize SSL context");
         }
+        // SSL_CTX_new can return a valid context while leaving errors on the
+        // error queue from partially-failed system config parsing (e.g. an
+        // invalid Ciphersuites value in the system openssl.cnf).
+        // See https://github.com/openssl/openssl/issues/30760
+        clear_stale_ssl_errors("SSL_CTX_new");
         const auto& ck_pair = _creds->get_certkey_pair();
         if (type == session_type::SERVER) {
             if (!ck_pair) {
