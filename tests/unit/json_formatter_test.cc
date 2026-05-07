@@ -202,3 +202,32 @@ SEASTAR_THREAD_TEST_CASE(formatter_write) {
     });
 #endif
 }
+
+SEASTAR_THREAD_TEST_CASE(formatter_write_strings) {
+    sstring s = "hello, world";
+    const char* expected = "\"hello, world\"";
+    formatter_check_expected(expected, [&s] (auto& out) {
+        json::formatter::write(out, s).get();
+    });
+    formatter_check_expected(expected, [&s] (auto& out) {
+        json::formatter::write(out, std::string(s)).get();
+    });
+    formatter_check_expected(expected, [&s] (auto& out) {
+        json::formatter::write(out, std::string_view(s)).get();
+    });
+    formatter_check_expected(expected, [&s] (auto& out) {
+        json::formatter::write(out, s.c_str()).get();
+    });
+
+    // Test that formatter::write works with a type that has a user-defined
+    // conversion to sstring but not to std::string_view.
+    // See scylladb/seastar#3184.
+    struct sstring_convertible {
+        sstring value;
+        operator sstring() const { return value; }
+    };
+    sstring_convertible sc{s};
+    formatter_check_expected(expected, [&sc] (auto& out) {
+        json::formatter::write(out, sc).get();
+    });
+}
