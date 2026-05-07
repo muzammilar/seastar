@@ -82,6 +82,16 @@ SEASTAR_TEST_CASE(test_strings) {
     BOOST_CHECK_EQUAL(expected, formatter::to_json(std::string_view(s)));
     BOOST_CHECK_EQUAL(expected, formatter::to_json(s.c_str()));
 
+    // Test that a type with a user-defined conversion to sstring
+    // (but not to std::string_view) works with to_json via a single
+    // implicit conversion. See scylladb/seastar#3184.
+    struct sstring_convertible {
+        sstring value;
+        operator sstring() const { return value; }
+    };
+    sstring_convertible sc{s};
+    BOOST_CHECK_EQUAL(expected, formatter::to_json(sc));
+
     return make_ready_future();
 }
 
